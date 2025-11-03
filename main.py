@@ -28,15 +28,11 @@ with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False) as tf:
     tf.write(GSHEETS_JSON)
     CREDS_FILE = tf.name
 
-# -------- Core logic --------
+# -------- HTTP session --------
 SESSION = requests.Session()
 SESSION.headers.update({"User-Agent": "Mozilla/5.0 (SKKNI-Checker)"})
-KEYWORDS_ORDERED = [
-    (r"\bDICABUT\b", "Dicabut"),
-    (r"\bTIDAK\s*BERLAKU\b", "Dicabut"),
-    (r"\bBERLAKU\b", "Berlaku"),
-]
 
+# -------- SerpAPI helper --------
 def serp_search(query: str, api_key: str, retries: int = 3, timeout: int = 30):
     url = "https://serpapi.com/search.json"
     last_err = None
@@ -54,18 +50,79 @@ def serp_search(query: str, api_key: str, retries: int = 3, timeout: int = 30):
             time.sleep(1.5 * (i + 1))
     raise last_err
 
+# -------- Stricter status detection --------
+def _status_from_blob(blob_up: str) -> str:
+    if re.search(r"\bTIDAK\s*BERLAKU\b", blob_up):
+        return "Dicabut"
+    if re.search(r"\bDICABUT\b", blob_up):
+        return "Dicabut"
+    if re.search(r"\bBERLAKU\b", blob_up):
+        return "Berlaku"
+    return "Unknown"
+
+def _looks_like_same_skkni(text_up: str, nomor: int, tahun: int) -> bool:
+    num_pat = rf"(NOMOR|NO\.)\s*{nomor}\b"
+    thn_pat = rf"(TAHUN)\s*{tahun}\b"
+    m_num = re.search(num_pat, text_up)
+    m_thn = re.search(thn_pat, text_up)
+    if not m_num or not m_thn:
+        return False
+    return abs(m_num.start() - m_thn.start()) <= 120
+
+def _is_listing_or_search_url(url: str) -> bool:
+    u = (url or "").lower()
+    return any(p in u for p in ["/search", "/?s=", "/kategori/", "/category/", "/tag/"])
+
+def _verify_from_page(url: str, timeout: int = 25) -> str:
+    try:
+        html = SESSION.get(url, timeout=timeout).text.upper()
+        if re.search(r"STATUS\s*[:\-]?\s*BERLAKU\b", html):
+            return "Berlaku"
+        if re.search(r"STATUS\s*[:\-]?\s*TIDAK\s*BERLAKU\b", html) or re.search(r"\bDICABUT\b", html):
+            return "Dicabut"
+    except Exception:
+        pass
+    return "Unknown"
+
 def check_status_snippet(nomor: int, tahun: int) -> str:
     query = f'"Nomor {nomor} Tahun {tahun}" "SKKNI" site:skkni.kemnaker.go.id'
     data = serp_search(query, SERP_KEY)
-    blob = " ".join(
-        (res.get("title", "") + " " + res.get("snippet", ""))
-        for res in data.get("organic_results", [])
-    ).upper()
-    for pattern, label in KEYWORDS_ORDERED:
-        if re.search(pattern, blob):
-            return label
-    return "Tidak ditemukan"
 
+    qualified = []
+    for res in data.get("organic_results", []) or []:
+        title   = (res.get("title") or "")
+        snippet = (res.get("snippet") or "")
+        url     = res.get("link") or res.get("displayed_link") or ""
+        blob_up = f"{title} {snippet}".upper()
+
+        if _is_listing_or_search_url(url):
+            continue
+        if "SKKNI" not in blob_up:
+            continue
+        if not _looks_like_same_skkni(blob_up, nomor, tahun):
+            continue
+
+        guess = _status_from_blob(blob_up)
+        qualified.append((url, guess))
+
+    if not qualified:
+        return "Tidak ditemukan"
+
+    # Verify only when guess is Dicabut to save quota
+    for url, guess in qualified:
+        if guess == "Dicabut":
+            verified = _verify_from_page(url)
+            if verified in ("Berlaku", "Dicabut"):
+                return verified
+
+    guesses = [g for _, g in qualified if g in ("Berlaku", "Dicabut")]
+    if not guesses:
+        return "Tidak ditemukan"
+    if "Berlaku" in guesses and "Dicabut" in guesses:
+        return "Berlaku"
+    return guesses[0]
+
+# -------- Email builder --------
 def build_dicabut_alert(df: pd.DataFrame) -> pd.DataFrame:
     df_alert = (
         df[df["Status"].astype(str).str.upper() == "DICABUT"]
@@ -107,8 +164,8 @@ def send_weekly_alert(df_alert: pd.DataFrame) -> bool:
     print(f"✓ Email sent to: {', '.join(RECIPIENTS)}")
     return True
 
+# -------- Sheet helpers --------
 def _ensure_and_get_col(ws, col_name: str) -> int:
-    """Return 1-based column index for a header name, creating it at the end if missing."""
     header = ws.row_values(1)
     if col_name in header:
         return header.index(col_name) + 1
@@ -116,12 +173,12 @@ def _ensure_and_get_col(ws, col_name: str) -> int:
     return len(header) + 1
 
 def _get_col(ws, col_name: str) -> int:
-    """Return 1-based column index for an existing header name, raise if missing."""
     header = ws.row_values(1)
     if col_name not in header:
         raise ValueError(f"Header '{col_name}' not found in the sheet.")
     return header.index(col_name) + 1
 
+# -------- Main --------
 def main():
     gc = gspread.service_account(filename=CREDS_FILE)
     ss = gc.open_by_key(SHEET_KEY)
@@ -177,28 +234,28 @@ def main():
 
     df_raw["Status"] = df_raw.apply(_map_status, axis=1)
 
-    # Resolve real column positions from the sheet header, do not assume adjacency
+    # Resolve actual header positions
     status_idx = _ensure_and_get_col(ws_out, "Status")
     col_nomor_idx  = _get_col(ws_out, "Nomor SKKNI")
     col_tahun_idx  = _get_col(ws_out, "Tahun SKKNI")
 
-    # Ensure the sheet has enough columns
+    # Ensure enough columns
     current_cols = len(ws_out.row_values(1))
     if status_idx > current_cols:
         ws_out.add_cols(status_idx - current_cols)
 
-    # Write the Status column
+    # Write Status column
     start = rowcol_to_a1(2, status_idx)
     end   = rowcol_to_a1(len(df_raw) + 1, status_idx)
     ws_out.update(f"{start}:{end}", [[v] for v in df_raw["Status"].tolist()])
     print(f"✓ Wrote 'Status' to column index {status_idx}")
 
-    # Highlight rows with Status == "Dicabut" for Nomor, Tahun, and Status columns
-    fmt = {"backgroundColor": {"red": 0.95, "green": 0.80, "blue": 0.80}}  # soft red
+    # Highlight Dicabut rows
+    fmt = {"backgroundColor": {"red": 0.95, "green": 0.80, "blue": 0.80}}
     mask_dicabut = df_raw["Status"].astype(str).str.upper() == "DICABUT"
     highlighted = []
     for i in df_raw.index[mask_dicabut]:
-        rownum = i + 2  # +1 header, +1 to 1-based
+        rownum = i + 2
         for c in (col_nomor_idx, col_tahun_idx, status_idx):
             a1 = rowcol_to_a1(rownum, c)
             ws_out.format(a1, fmt)
