@@ -5,8 +5,8 @@ from email.mime.multipart import MIMEMultipart
 from gspread.utils import rowcol_to_a1
 
 # -------- Config via env vars --------
-INPUT_GID  = int(os.getenv("INPUT_GID", "372282629"))
-OUTPUT_GID = int(os.getenv("OUTPUT_GID", "372282629"))
+INPUT_GID  = int(os.getenv("INPUT_GID", "1470851342"))
+OUTPUT_GID = int(os.getenv("OUTPUT_GID", "1470851342"))
 SHEET_KEY  = os.getenv("SHEET_KEY")  # required
 SERP_KEY   = os.getenv("SERPAPI_API_KEY")  # required
 
