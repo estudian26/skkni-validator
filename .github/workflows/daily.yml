@@ -25,8 +25,8 @@ jobs:
       - name: Run SKKNI checker
         env:
           # your IDs
-          INPUT_GID: "372282629"
-          OUTPUT_GID: "372282629"
+          INPUT_GID: "1470851342"
+          OUTPUT_GID: "1470851342"
           SHEET_KEY: ${{ secrets.SHEET_KEY }}
 
           # secrets
